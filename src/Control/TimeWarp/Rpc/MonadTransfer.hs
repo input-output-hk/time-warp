@@ -202,6 +202,7 @@ instance (MonadIO m, MonadMask m, WithLogger m)
 
 -- | Maps entry of `ResponseT`.
 -- TODO: implement `hoist` instead, it should be enough.
+{-# INLINE mapResponseT #-}
 mapResponseT :: (m a -> n b) -> ResponseT m a -> ResponseT n b
 mapResponseT how = ResponseT . mapReaderT how . getResponseT
 
