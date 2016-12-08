@@ -440,11 +440,23 @@ sfProcessSocket SocketFrame{..} sock = do
             datm <- liftIO . atomically $ TBM.readTBMChan sfOutChan
             forM_ datm $
                 \dat@(bs, notif) -> do
-                    let pushback = liftIO . atomically $ TBM.unGetTBMChan sfOutChan dat
-                    unmask (sourceLbs bs $$ sinkSocket sock) `onException` pushback
+                    -- Potential issue here.
+                    -- Here's what we previously had:
+                    --
+                    --let pushback = liftIO . atomically $ TBM.unGetTBMChan sfOutChan dat
+                    --unmask (sourceLbs bs $$ sinkSocket sock) `onException` pushback
+                    --
+                    -- Here we drop the data which failed to send. Perhaps we
+                    -- could still hold onto it (TBM.unGetTBMChan) so long as
+                    -- we expect that, after some reasonable amount of time,
+                    -- the data will either go down the wire, or we'll give up
+                    -- and let it be collected.
+                    let logException = commLog . logInfo $
+                          sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
+                    unmask $ (sourceLbs bs $$ sinkSocket sock) `onException` logException
                     -- TODO: if get async exception here   ^, will send msg twice
                     liftIO notif
-                    unmask foreverSend
+                    foreverSend
 
     foreverRec :: m ()
     foreverRec = do
@@ -608,13 +620,18 @@ listenOutbound addr sink = do
     outConnRec conn sink
     return $ stopAllJobs $ outConnJobCurator conn
 
-
+-- | Grabs an existing output connection or creates a new one. If a new one
+--   is created, a thread is spawned which will attempt to get a TCP connection
+--   to the given address by way of 'getSocketFamilyTCP'. When a connection is
+--   established, 'sfProcessSocket' goes to work. If it throws *any* exception,
+--   bracket will close the socket, and then attempt(s) are made to reconnect
+--   subject to a limit defined in the 'Settings' of the 'Transfer' monad.
 getOutConnOrOpen :: NetworkAddress -> Transfer OutputConnection
 getOutConnOrOpen addr@(host, fromIntegral -> port) =
     mask $
         \unmask -> do
             (conn, sfm) <- ensureConnExist
-            forM_ sfm $
+            forM_ (sfm :: Maybe SocketFrame) $
                 \sf -> addSafeThreadJob (sfJobCurator sf) $
                     unmask (startWorker sf) `finally` releaseConn sf
             return conn
@@ -642,16 +659,20 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         failsInRow <- liftIO $ IR.newIORef 0
         commLog . logInfo $ sformat ("Lively socket to "%stext%" created, processing")
             (sfPeerAddr sf)
-        withRecovery sf failsInRow $
-            bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
-                    (liftIO . NS.close) $
-                    \sock -> do
-                        liftIO $ IR.writeIORef failsInRow 0
-                        commLog . logInfo $
-                            sformat ("Established connection to "%stext) (sfPeerAddr sf)
-                        sfProcessSocket sf sock
+        withRecovery sf failsInRow
 
-    withRecovery sf failsInRow action = catchAll action $ \e -> do
+    establishConn sf failsInRow =
+        bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
+                (liftIO . NS.close) $
+                \sock -> do
+                    commLog . logInfo $
+                        sformat ("Established connection to "%stext) (sfPeerAddr sf)
+                    _ <- liftIO $ IR.atomicWriteIORef failsInRow 0
+                    sfProcessSocket sf sock
+
+    -- Repeatedly try to establish a TCP connection, giving up after a set
+    -- number of exceptions as determined by the 'Settings' of this 'Transfer'
+    withRecovery sf failsInRow = catchAll (establishConn sf failsInRow) $ \e -> do
         closed <- isInterrupted (sfJobCurator sf)
         unless closed $ do
             commLog . logWarning $
@@ -659,17 +680,17 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
                     addrName e
             reconnect <- reconnectPolicy <$> Transfer ask
             fails <- liftIO $ succ <$> IR.readIORef failsInRow
-            liftIO $ IR.writeIORef failsInRow fails
+            liftIO $ IR.atomicWriteIORef failsInRow fails
             maybeReconnect <- reconnect fails
             case maybeReconnect of
                 Nothing ->
                     commLog . logWarning $
-                        sformat ("Can't connect to "%shown%", closing connection") addr
+                        sformat ("Can't connect to "%shown%", aborting connection") addr
                 Just delay -> do
                     commLog . logWarning $
-                        sformat ("Reconnect in "%shown) delay
+                        sformat ("Reconnect to "%shown%" in "%shown) addr delay
                     wait (for delay)
-                    withRecovery sf failsInRow action
+                    withRecovery sf failsInRow
 
     releaseConn sf = do
         interruptAllJobs (sfJobCurator sf) Plain
