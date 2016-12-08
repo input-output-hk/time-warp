@@ -94,7 +94,7 @@ import           Control.Monad.Trans.Control        (MonadBaseControl (..))
 import           Control.Monad.Extra                (whenM)
 import qualified Data.ByteString                    as BS
 import qualified Data.ByteString.Lazy               as BL
-import           Data.Conduit                       (Sink, Source, ($$))
+import           Data.Conduit                       (Sink, Source, ($$), (=$=), yield, await)
 import           Data.Conduit.Binary                (sinkLbs, sourceLbs)
 import           Data.Conduit.Network               (sinkSocket, sourceSocket)
 import           Data.Conduit.TMChan                (sinkTBMChan, sourceTBMChan)
@@ -103,7 +103,7 @@ import           Data.HashMap.Strict                (HashMap)
 import qualified Data.IORef                         as IR
 import           Data.List                          (intersperse)
 import           Data.Streaming.Network             (acceptSafe, bindPortTCP,
-                                                     getSocketFamilyTCP)
+                                                     getSocketFamilyTCP, safeRecv)
 import           Data.Text                          (Text)
 import qualified Data.Text                          as T
 import           Data.Text.Buildable                (Buildable (build), build)
@@ -137,8 +137,67 @@ import           Control.TimeWarp.Timed             (Microsecond, MonadTimed, Th
 import           GHC.Stats                          (getGCStats, GCStats(..))
 import           System.Mem                         (performGC)
 import           Debug.Trace                        (traceEventIO)
+import           System.IO.Unsafe                   (unsafePerformIO)
 
 -- * Util
+
+-- A global mutable cell because we want to use it for incoming and outgoing
+-- connections, but I don't want to change the Transfer monad.
+{-# NOINLINE totalInflow #-}
+totalInflow :: IR.IORef Int
+totalInflow = unsafePerformIO (IR.newIORef 0)
+
+--sourceSocket' :: MonadIO m => IORef Integer -> Socket -> Producer m ByteString
+sourceSocket'
+  :: forall m .
+     ( CanLog m, HasLoggerName m, MonadIO m )
+  => IR.IORef Int
+  -> NS.Socket
+  -> Source m BS.ByteString
+sourceSocket' total socket =
+  loop
+  where
+  loop = do
+    bs <- lift $ liftIO $ safeRecv socket 4096
+    let bsSize = BS.length bs
+    if BS.null bs
+    then return ()
+    else do totalSoFar <- liftIO $ IR.atomicModifyIORef' total (\i -> let total = i + bsSize in (total, total))
+            () <- lift . commLog . logInfo $ sformat ("sourceSocket' total seen so far is " % int) totalSoFar
+            yield bs
+            loop
+
+-- | Like sinkTBMChan from the library but this one will log when the channel
+--   is full.
+sinkTBMChan'
+  :: forall m .
+     ( CanLog m, HasLoggerName m, MonadIO m )
+  => TBM.TBMChan BS.ByteString
+  -> Bool
+  -> Sink BS.ByteString m ()
+sinkTBMChan' chan shouldClose = loop >> closer
+  where
+  loop = do
+    maybeNext <- await
+    case maybeNext of
+      Nothing -> pure ()
+      Just x -> do
+        wasWritten <- liftIO . atomically $ TBM.tryWriteTBMChan chan x
+        case wasWritten of
+          Nothing -> pure ()
+          Just False -> do
+            -- Log and then do a potentially blocking write
+            let bsSize = BS.length x
+            () <- liftIO performGC
+            stats <- liftIO getGCStats
+            let cpuTime = gcCpuSeconds stats
+            let bytes = fromIntegral (currentBytesUsed stats) :: Int
+            lift . commLog . logInfo $ sformat ("sinkTBMChan' blocking on full channel at time " % float % " pending data of size " % int % " heap size is " % int) cpuTime bsSize bytes
+            liftIO . atomically $ TBM.writeTBMChan chan x
+            loop
+          Just True -> loop
+  closer = when shouldClose (liftIO . atomically $ TBM.closeTBMChan chan)
+
 
 logSeverityUnlessClosed :: (WithLogger m, MonadIO m)
                         => Severity -> JobCurator -> Text -> m ()
@@ -346,8 +405,9 @@ sfMkResponseCtx sf =
 
 -- | Starts workers, which connect channels in `SocketFrame` with real `NS.Socket`.
 -- If error in any worker occurs, it's propagated.
-sfProcessSocket :: (MonadIO m, MonadMask m, MonadTimed m, WithLogger m)
-                => SocketFrame -> NS.Socket -> m ()
+sfProcessSocket
+  :: forall m . (MonadIO m, MonadMask m, MonadTimed m, WithLogger m)
+  => SocketFrame -> NS.Socket -> m ()
 sfProcessSocket SocketFrame{..} sock = do
     -- TODO: rewrite to async when MonadTimed supports it
     -- create channel to notify about error
@@ -386,8 +446,9 @@ sfProcessSocket SocketFrame{..} sock = do
                     liftIO notif
                     unmask foreverSend
 
+    foreverRec :: m ()
     foreverRec = do
-        hoist liftIO (sourceSocket sock) $$ sinkTBMChan sfInChan False
+        sourceSocket' totalInflow sock $$ sinkTBMChan' sfInChan False
         unlessInterrupted sfJobCurator $
             throwM PeerClosedConnection
 
@@ -505,6 +566,8 @@ listenInbound (fromIntegral -> port) sink = do
         liftIO $ NS.setSocketOption sock NS.ReuseAddr 1
 
         -- sfReceive forks, does not block.
+        -- It pulls data from the socket frame's in channel, which is fed by
+        -- the socket (see sfProcessSocket).
         sfReceive sf sink
         unlessInterrupted jc $
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
