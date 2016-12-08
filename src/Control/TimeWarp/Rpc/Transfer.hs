@@ -105,6 +105,7 @@ import           Data.List                          (intersperse)
 import           Data.Streaming.Network             (acceptSafe, bindPortTCP,
                                                      getSocketFamilyTCP)
 import           Data.Text                          (Text)
+import qualified Data.Text                          as T
 import           Data.Text.Buildable                (Buildable (build), build)
 import           Data.Text.Encoding                 (decodeUtf8)
 import           Data.Typeable                      (Typeable)
@@ -135,6 +136,7 @@ import           Control.TimeWarp.Timed             (Microsecond, MonadTimed, Th
                                                      killThread, sec, wait)
 import           GHC.Stats                          (getGCStats, GCStats(..))
 import           System.Mem                         (performGC)
+import           Debug.Trace                        (traceEventIO)
 
 -- * Util
 
@@ -307,12 +309,12 @@ sfReceive sf@SocketFrame{..} sink = do
             commLog . logWarning $ sformat ("Server error: "%shown) e
             interruptAllJobs sfJobCurator Plain
 
-    logOnInterruptTimeout = commLog . logDebug $
+    logOnInterruptTimeout = commLog . logInfo $
         sformat ("While closing socket to "%stext%" listener "%
                  "worked for too long, closing with no regard to it") sfPeerAddr
 
     logListeningHappilyStopped =
-        commLog . logDebug $
+        commLog . logInfo $
             sformat ("Listening on socket to "%stext%" happily stopped") sfPeerAddr
 
 sfClose :: SocketFrame -> IO ()
@@ -355,7 +357,7 @@ sfProcessSocket SocketFrame{..} sock = do
         sformat ("foreverSend on "%stext) sfPeerAddr
     rtid <- forkLabeled "sfProcessSocket receive" $ reportErrors eventChan foreverRec $
         sformat ("foreverRec on "%stext) sfPeerAddr
-    commLog . logDebug $ sformat ("Start processing of socket to "%stext) sfPeerAddr
+    commLog . logInfo $ sformat ("Start processing of socket to "%stext) sfPeerAddr
     -- check whether @isClosed@ keeps @True@
     ctid <- fork $ do
         let jm = getJobCurator sfJobCurator
@@ -368,7 +370,7 @@ sfProcessSocket SocketFrame{..} sock = do
             mapM_ killThread [stid, rtid, ctid]
             throwM e
     event <- liftIO . atomically $ TC.readTChan eventChan
-    commLog . logDebug $ sformat ("Stop processing socket to "%stext) sfPeerAddr
+    commLog . logInfo $ sformat ("Stop processing socket to "%stext) sfPeerAddr
     -- Left - worker error, Right - get closed
     either onError return event
     -- at this point workers are stopped
@@ -391,7 +393,7 @@ sfProcessSocket SocketFrame{..} sock = do
 
     reportErrors eventChan action desc =
         action `catchAll` \e -> do
-            commLog . logDebug $ sformat ("Caught error on "%stext%": " % shown) desc e
+            commLog . logInfo $ sformat ("Caught error on "%stext%": " % shown) desc e
             liftIO . atomically . TC.writeTChan eventChan . Left $ e
 
 
@@ -460,12 +462,12 @@ listenInbound (fromIntegral -> port) sink = do
                         serve lsocket serverJobCurator
     -- return closer
     inCurrentContext $ do
-        commLog . logDebug $ sformat ("Stopping server at "%int) port
+        commLog . logInfo $ sformat ("Stopping server at "%int) port
         stopAllJobs serverJobCurator
-        commLog . logDebug $ sformat ("Server at "%int%" fully stopped") port
+        commLog . logInfo $ sformat ("Server at "%int%" fully stopped") port
   where
     serve lsocket serverJobCurator = forever $
-        bracketOnError (liftIO $ acceptSafe lsocket) (liftIO . NS.close . fst) $
+        bracketOnError (acceptAndTrace lsocket) closeAndTrace $
             \(sock, addr) -> mask $
                 \unmask -> forkLabeled_ "listenInbound accepted connection" $ do
                     settings <- Transfer ask
@@ -476,25 +478,44 @@ listenInbound (fromIntegral -> port) sink = do
                     unmask (processSocket sock sf serverJobCurator)
                         `finally` liftIO (NS.close sock)
 
+    acceptAndTrace lsocket = do
+      (sock, addr) <- liftIO $ acceptSafe lsocket
+      () <- liftIO performGC
+      stats <- liftIO getGCStats
+      let cpuTime = gcCpuSeconds stats
+      let bytes = fromIntegral (currentBytesUsed stats) :: Int
+      commLog . logInfo $ sformat ("Accepted connection at " % float % " current bytes allocated " % int) cpuTime bytes
+      let readableAddr = buildSockAddr addr
+      liftIO . traceEventIO . T.unpack $ sformat ("START connection " % stext) readableAddr
+      pure (sock, addr)
+
+    closeAndTrace (sock, addr) = do
+      liftIO . NS.close $ sock
+      () <- liftIO performGC
+      stats <- liftIO getGCStats
+      let cpuTime = gcCpuSeconds stats
+      let bytes = fromIntegral (currentBytesUsed stats) :: Int
+      commLog . logInfo $ sformat ("Closed connection at " % float % " current bytes allocated " % int) cpuTime bytes
+      let readableAddr = buildSockAddr addr
+      liftIO . traceEventIO . T.unpack $ sformat ("STOP connection " %stext) readableAddr
+      pure ()
+
     -- makes socket work, finishes once it's fully shutdown
     processSocket sock sf@SocketFrame{..} jc = do
-        () <- liftIO performGC
-        stats <- liftIO getGCStats
-        let cpuTime = gcCpuSeconds stats
-        let bytes = fromIntegral (bytesAllocated stats) :: Int
-        commLog . logInfo $ sformat ("Accpted connection at " % float % " bytes allocated " % int) cpuTime bytes
         liftIO $ NS.setSocketOption sock NS.ReuseAddr 1
 
+        -- sfReceive forks, does not block.
         sfReceive sf sink
         unlessInterrupted jc $
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
+                -- sfProcessSocket blocks until it gets an event.
                 sfProcessSocket sf sock
                 logInputConnHappilyClosed sfPeerAddr
 
     -- * Logs
 
     logNewInputConnection addr =
-        commLog . logDebug $
+        commLog . logInfo $
             sformat ("New input connection: "%int%" <- "%stext)
             port addr
 
@@ -556,14 +577,14 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
 
     startWorker sf = do
         failsInRow <- liftIO $ IR.newIORef 0
-        commLog . logDebug $ sformat ("Lively socket to "%stext%" created, processing")
+        commLog . logInfo $ sformat ("Lively socket to "%stext%" created, processing")
             (sfPeerAddr sf)
         withRecovery sf failsInRow $
             bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
                     (liftIO . NS.close) $
                     \sock -> do
                         liftIO $ IR.writeIORef failsInRow 0
-                        commLog . logDebug $
+                        commLog . logInfo $
                             sformat ("Established connection to "%stext) (sfPeerAddr sf)
                         sfProcessSocket sf sock
 
@@ -590,7 +611,7 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
     releaseConn sf = do
         interruptAllJobs (sfJobCurator sf) Plain
         modifyManager $ outputConn . at addr .= Nothing
-        commLog . logDebug $
+        commLog . logInfo $
             sformat ("Socket to "%stext%" closed") addrName
 
 

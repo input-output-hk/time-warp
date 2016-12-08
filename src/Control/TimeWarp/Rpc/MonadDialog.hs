@@ -93,13 +93,14 @@ import           Control.Monad.Trans.Control        (ComposeSt, MonadBaseControl
                                                      MonadTransControl (..), StM,
                                                      defaultLiftBaseWith, defaultLiftWith,
                                                      defaultRestoreM, defaultRestoreT)
+import           Control.Monad.IO.Class             (liftIO, MonadIO)
 import           Data.Binary                        (Binary)
 import           Data.Conduit                       (yield, (=$=))
 import qualified Data.Conduit.List                  as CL
 import           Data.Map                           as M
 import           Data.Proxy                         (Proxy (..))
-import           Formatting                         (sformat, shown, stext, (%))
-import           System.Wlog                        (CanLog, HasLoggerName,
+import           Formatting                         (sformat, shown, stext, (%), float, int)
+import           System.Wlog                        (CanLog, HasLoggerName, logInfo,
                                                      LoggerNameBox (..), WithLogger,
                                                      logDebug, logError, logWarning)
 
@@ -121,6 +122,8 @@ import           Control.TimeWarp.Rpc.MonadTransfer (Binding,
 import           Control.TimeWarp.Timed             (MonadTimed, ThreadId, fork_,
                                                      forkLabeled_)
 import           Debug.Trace                        (traceEvent)
+import           GHC.Stats                          (GCStats(..), getGCStats)
+import           System.Mem                         (performGC)
 
 
 -- * MonadRpc
@@ -278,9 +281,13 @@ listenRP packing binding listeners rawListener = listenRaw binding loop
         unpackMsg packing =$= CL.head >>= mapM_ processContent
 
     processContent rawMsg@(HeaderNRawData header raw) = {-# SCC processContent #-} do
-        () <- pure (traceEvent ("processContent rawData of size : " ++ show (rawDataSize raw)) ())
-        --lift . commLog . logInfo $
-        --  sformat ("processContent rawData of size " % int) (rawDataSize raw)
+        --() <- pure (traceEvent ("processContent rawData of size : " ++ show (rawDataSize raw)) ())
+        () <- liftIO performGC
+        stats <- liftIO getGCStats
+        let cpuTime = gcCpuSeconds stats
+        let bytes = fromIntegral (currentBytesUsed stats) :: Int
+        lift . commLog . logInfo $
+          sformat ("processContent at " % float % " got rawData of size " % int % " heap size is " % int) cpuTime (rawDataSize raw) bytes
         nameM <- lift $ (Right <$> selector rawMsg) `catchAll` (return . Left)
         case nameM of
             Left e ->
