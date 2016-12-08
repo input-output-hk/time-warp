@@ -72,7 +72,7 @@ module Control.TimeWarp.Rpc.Transfer
        ) where
 
 import qualified Control.Concurrent                 as C
-import           Control.Concurrent.STM             (STM, atomically, check)
+import           Control.Concurrent.STM             (STM, atomically, check, orElse)
 import qualified Control.Concurrent.STM.TBMChan     as TBM
 import qualified Control.Concurrent.STM.TChan       as TC
 import qualified Control.Concurrent.STM.TVar        as TV
@@ -321,10 +321,25 @@ sfSend SocketFrame{..} src = do
 
     -- wait till data get consumed by socket, but immediatelly quit on socket
     -- get closed.
-    liftIO . atomically $ do
-        let jm = getJobCurator sfJobCurator
-        closed <- view jcIsClosed <$> TV.readTVar jm
-        unless closed awaiter
+    --
+    -- This will block until somebody hits 'notifier', or the job curator is
+    -- closed, so we must take care to ensure that, eventually, one of these
+    -- happens.
+    --
+    -- A note on the BlockedIndefinitelyOnSTM. This should come up in case
+    -- all other references to TVar in mkMonitor are lost. There's one other
+    -- reference, namely the one in the TBMChan that we wrote just above. So
+    -- if it's cleared from the queue and the notifier is not run, we should
+    -- get that exception. However, if it's not cleared from the queue, and
+    -- the SocketFrame is retained in some other thread, we'll just wait here.
+    let jm = getJobCurator sfJobCurator
+    -- 'checkClosed' will retry if the job curator is not closed.
+    -- 'awaiter', as defined in 'mkMonitor', follows the same motif.
+    -- We combine them with 'orElse' to get an STM which will retry until
+    -- either the job curator is closed or the notifier is called.
+    let checkClosed = check =<< (view jcIsClosed <$> TV.readTVar jm)
+    let waitNotifyOrClose = const () <$> (checkClosed `orElse` awaiter)
+    liftIO . atomically $ waitNotifyOrClose
   where
     -- creates pair (@notifier@, @awaiter@), where @awaiter@ blocks thread
     -- until @notifier@ is called.
@@ -424,6 +439,8 @@ sfProcessSocket SocketFrame{..} sock = do
         liftIO . atomically $ check . view jcIsClosed =<< TV.readTVar jm
         liftIO . atomically $
             TC.writeTChan eventChan $ Right ()
+        -- NB the thread which didn't finish will get a ThreadKilled
+        -- exception and it'll crop up in the chan via reportErrors.
         mapM_ killThread [stid, rtid]
     -- wait for error messages
     let onError e = do
@@ -455,6 +472,14 @@ sfProcessSocket SocketFrame{..} sock = do
                           sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
                     unmask $ (sourceLbs bs $$ sinkSocket sock) `onException` logException
                     -- TODO: if get async exception here   ^, will send msg twice
+                    --
+                    -- FIXME ?
+                    -- If an exception is raised, we don't call notif.
+                    -- Does this mean that an sfSend on this frame (which sinks
+                    -- to sfOutChan) will block indefinitely? The notifier is
+                    -- still alive (in the TBMChan, we push it back on), so GHC
+                    -- wouldn't say blocked indefinitely on an STM unless the
+                    -- SocketFrame itself goes away.
                     liftIO notif
                     foreverSend
 
@@ -628,6 +653,21 @@ listenOutbound addr sink = do
 --   subject to a limit defined in the 'Settings' of the 'Transfer' monad.
 getOutConnOrOpen :: NetworkAddress -> Transfer OutputConnection
 getOutConnOrOpen addr@(host, fromIntegral -> port) =
+    -- Obtain an 'OutputConnection', possibly an existing one for this address.
+    -- If there's no existing connection, make a new 'SocketFrame' and
+    -- corresponding 'OutputConnection' and spawn a thread to make it "lively".
+    -- When that thread dies, release the 'SocketFrame' from the pool.
+    --
+    -- Suppose the 'SocketFrame' is released (the worker thread finishes,
+    -- whether normally or exceptionally). The entry for this address in the
+    -- pool will be cleared, but an 'OutputConnection' derived from that
+    -- 'SocketFrame' may still be around! The caller of this function gets a
+    -- hold of it. It retains the input and output 'TBMChan's for the dead
+    -- 'SocketFrame' (nobody is clearing these).
+    -- The 'OutputConnection' also retains the job curator of the 'SocketFrame',
+    -- and when the latter is released, 'interruptAllJobs' is called on that
+    -- curator.
+    --
     mask $
         \unmask -> do
             (conn, sfm) <- ensureConnExist
