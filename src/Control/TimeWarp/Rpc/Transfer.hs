@@ -119,7 +119,8 @@ import           System.Wlog                        (CanLog, HasLoggerName, Logg
 
 import           Control.TimeWarp.Manager           (InterruptType (..), JobCurator (..),
                                                      addManagerAsJob, addSafeThreadJob,
-                                                     addThreadJob, interruptAllJobs,
+                                                     addThreadJob, addThreadJobLabeled,
+                                                     interruptAllJobs,
                                                      isInterrupted, jcIsClosed,
                                                      mkJobCurator, stopAllJobs,
                                                      unlessInterrupted)
@@ -130,6 +131,7 @@ import           Control.TimeWarp.Rpc.MonadTransfer (Binding (..), MonadTransfer
                                                      sendRaw)
 import           Control.TimeWarp.Timed             (Microsecond, MonadTimed, ThreadId,
                                                      TimedIO, for, fork, fork_, interval,
+                                                     forkLabeled, forkLabeled_,
                                                      killThread, sec, wait)
 
 -- * Util
@@ -293,9 +295,10 @@ sfReceive sf@SocketFrame{..} sink = do
     let interruptType = WithTimeout (interval 3 sec) onTimeout
     mask $ \unmask -> do
         addManagerAsJob sfJobCurator interruptType liManager
-        addThreadJob liManager $ unmask $ logOnErr $ do  -- TODO: reconnect on error?
+        addThreadJobLabeled "sourceTBMChan" liManager $ unmask $ logOnErr $ do  -- TODO: reconnect on error?
             (sourceTBMChan sfInChan $$ sink) `runResponseT` sfMkResponseCtx sf
             logListeningHappilyStopped
+    pure ()
   where
     logOnErr = handleAll $ \e ->
         unlessInterrupted sfJobCurator $ do
@@ -346,9 +349,9 @@ sfProcessSocket SocketFrame{..} sock = do
     -- create channel to notify about error
     eventChan  <- liftIO TC.newTChanIO
     -- create worker threads
-    stid <- fork $ reportErrors eventChan foreverSend $
+    stid <- forkLabeled "sfProcessSocket send" $ reportErrors eventChan foreverSend $
         sformat ("foreverSend on "%stext) sfPeerAddr
-    rtid <- fork $ reportErrors eventChan foreverRec $
+    rtid <- forkLabeled "sfProcessSocket receive" $ reportErrors eventChan foreverRec $
         sformat ("foreverRec on "%stext) sfPeerAddr
     commLog . logDebug $ sformat ("Start processing of socket to "%stext) sfPeerAddr
     -- check whether @isClosed@ keeps @True@
@@ -437,6 +440,10 @@ buildSockAddr (NS.SockAddrCan addr) = sformat ("can:"%int) addr
 buildNetworkAddress :: NetworkAddress -> PeerAddr
 buildNetworkAddress (host, port) = sformat (stext%":"%int) (decodeUtf8 host) port
 
+-- | Binds TCP socket on a given port (any host).
+--   A thread job is added to a JobCurator. This thread uses `acceptSafe` to
+--   accept a connection on the socket and once it does, it spawns a thread
+--   of its own which dumps the socket data to the sink.
 listenInbound :: Port
               -> Sink BS.ByteString (ResponseT Transfer) ()
               -> Transfer (Transfer ())
@@ -445,7 +452,7 @@ listenInbound (fromIntegral -> port) sink = do
     -- launch server
     bracketOnError (liftIO $ bindPortTCP port "*") (liftIO . NS.close) $
         \lsocket -> mask $
-            \unmask -> addThreadJob serverJobCurator $
+            \unmask -> addThreadJobLabeled "listenInbound" serverJobCurator $
                 flip finally (liftIO $ NS.close lsocket) . unmask $
                     handleAll (logOnServerError serverJobCurator) $
                         serve lsocket serverJobCurator
@@ -458,7 +465,7 @@ listenInbound (fromIntegral -> port) sink = do
     serve lsocket serverJobCurator = forever $
         bracketOnError (liftIO $ acceptSafe lsocket) (liftIO . NS.close . fst) $
             \(sock, addr) -> mask $
-                \unmask -> fork_ $ do
+                \unmask -> forkLabeled_ "listenInbound accepted connection" $ do
                     settings <- Transfer ask
                     sf@SocketFrame{..} <- mkSocketFrame settings $ buildSockAddr addr
                     addManagerAsJob serverJobCurator Plain sfJobCurator

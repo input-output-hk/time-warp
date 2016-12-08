@@ -111,13 +111,16 @@ import           Control.TimeWarp.Rpc.Message       (HeaderNContentData (..),
                                                      HeaderNRawData (..), Message (..),
                                                      MessageName, Packable (..),
                                                      RawData (..), Unpackable (..),
+                                                     rawDataSize,
                                                      parseHeaderNNameData,
                                                      parseHeaderNNameNContentData)
 import           Control.TimeWarp.Rpc.MonadTransfer (Binding,
                                                      MonadResponse (peerAddr, replyRaw),
                                                      MonadTransfer (..), NetworkAddress,
                                                      ResponseT (..), commLog)
-import           Control.TimeWarp.Timed             (MonadTimed, ThreadId, fork_)
+import           Control.TimeWarp.Timed             (MonadTimed, ThreadId, fork_,
+                                                     forkLabeled_)
+import           Debug.Trace                        (traceEvent)
 
 
 -- * MonadRpc
@@ -266,25 +269,31 @@ listenRP :: (Unpackable p (HeaderNRawData h), MonadListener m)
          => p -> Binding -> [ListenerH p h m] -> ListenerR h m -> m (m ())
 listenRP packing binding listeners rawListener = listenRaw binding loop
   where
+
+    -- A conduit to consume some output provided under the hood by listenRaw.
+    -- In practice the inflow comes from a TCP connection.
     loop =
         -- [TW-92] Review exception handling on `listen`
         -- do we catch exception here? Do we close conduit properly?
         unpackMsg packing =$= CL.head >>= mapM_ processContent
 
-    processContent rawMsg@(HeaderNRawData header raw) = do
+    processContent rawMsg@(HeaderNRawData header raw) = {-# SCC processContent #-} do
+        () <- pure (traceEvent ("processContent rawData of size : " ++ show (rawDataSize raw)) ())
+        --lift . commLog . logInfo $
+        --  sformat ("processContent rawData of size " % int) (rawDataSize raw)
         nameM <- lift $ (Right <$> selector rawMsg) `catchAll` (return . Left)
         case nameM of
             Left e ->
                 lift . commLog . logWarning $
                     sformat ("Error parsing message name: " % shown) e
             Right (name, Nothing) -> do
-                lift . fork_ . void $ invokeRawListenerSafe $ rawListener (header, raw)
+                lift . forkLabeled_ "processContent Nothing" . void $ invokeRawListenerSafe $ rawListener (header, raw)
                 lift . commLog . logWarning $
                     sformat ("No listener with name "%stext%" defined") name
                 loop
             Right (name, Just (ListenerH f)) -> handleAll handleE $ parseHeaderNNameNContentData rawMsg >>=
                 \(HeaderNNameNContentData _ _ r) -> do
-                    lift . fork_ $ do
+                    lift . forkLabeled_ "processContent Just" $ do
                         cont <- invokeRawListenerSafe $ rawListener (header, raw)
                         peer <- peerAddr
                         when cont $ do

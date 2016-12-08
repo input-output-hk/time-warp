@@ -53,6 +53,7 @@ module Control.TimeWarp.Rpc.Message
 
        -- * Util
        , messageName'
+       , rawDataSize
        ) where
 
 import           Control.Monad                     (when)
@@ -74,6 +75,7 @@ import qualified Data.Text                         as T
 import           Data.Text.Buildable               (Buildable)
 import           Data.Typeable                     (Typeable)
 import qualified Formatting                        as F
+import           Debug.Trace                       (traceEvent)
 
 
 -- * Message
@@ -107,6 +109,10 @@ data ContentData r = ContentData r
 -- object.
 data RawData = RawData ByteString
 
+-- | Size of RawData in bytes
+rawDataSize :: RawData -> Int
+rawDataSize (RawData bs) = BS.length bs
+
 -- | Message's name.
 data NameData = NameData MessageName
 
@@ -139,14 +145,16 @@ messageName' = messageName . proxyOf
 
 -- | Like `conduitGet`, but applicable to be used inside `unpackMsg`.
 conduitGet' :: MonadThrow m => Get b -> Conduit ByteString m b
-conduitGet' g = start
+conduitGet' g = {-# SCC "conduitGet'" #-} start
   where
     start = do mx <- await
                case mx of
                   Nothing -> return ()
-                  Just x -> do
-                               go (runGetIncremental g `pushChunk` x)
-    go (Done bs _ v) = do when (not $ BS.null bs) $ leftover bs
+                  Just x -> do {-# SCC "conduitGet'_go" #-} go (runGetIncremental g `pushChunk` x)
+    -- Could this be the issue? leftover kinda screams space leak.
+    go (Done bs _ v) = do when (not $ BS.null bs) $ do
+                            () <- pure (traceEvent ("conduitGet' has leftover of length " ++ (show (BS.length bs))) ())
+                            leftover bs
                           yield v
                           start
     go (Fail u o e)  = throwM (ParseError u o e)
