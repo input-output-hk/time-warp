@@ -190,7 +190,7 @@ sinkTBMChan' chan shouldClose = loop >> closer
             let bsSize = BS.length x
             () <- liftIO performGC
             stats <- liftIO getGCStats
-            let cpuTime = gcCpuSeconds stats
+            let cpuTime = cpuSeconds stats
             let bytes = fromIntegral (currentBytesUsed stats) :: Int
             lift . commLog . logInfo $ sformat ("sinkTBMChan' blocking on full channel at time " % float % " pending data of size " % int % " heap size is " % int) cpuTime bsSize bytes
             liftIO . atomically $ TBM.writeTBMChan chan x
@@ -543,7 +543,7 @@ listenInbound (fromIntegral -> port) sink = do
       (sock, addr) <- liftIO $ acceptSafe lsocket
       () <- liftIO performGC
       stats <- liftIO getGCStats
-      let cpuTime = gcCpuSeconds stats
+      let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
       commLog . logInfo $ sformat ("Accepted connection at " % float % " current bytes allocated " % int) cpuTime bytes
       let readableAddr = buildSockAddr addr
@@ -554,7 +554,7 @@ listenInbound (fromIntegral -> port) sink = do
       liftIO . NS.close $ sock
       () <- liftIO performGC
       stats <- liftIO getGCStats
-      let cpuTime = gcCpuSeconds stats
+      let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
       commLog . logInfo $ sformat ("Closed connection at " % float % " current bytes allocated " % int) cpuTime bytes
       let readableAddr = buildSockAddr addr

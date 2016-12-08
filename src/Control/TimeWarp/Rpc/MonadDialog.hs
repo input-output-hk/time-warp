@@ -284,7 +284,7 @@ listenRP packing binding listeners rawListener = listenRaw binding loop
         --() <- pure (traceEvent ("processContent rawData of size : " ++ show (rawDataSize raw)) ())
         () <- liftIO performGC
         stats <- liftIO getGCStats
-        let cpuTime = gcCpuSeconds stats
+        let cpuTime = cpuSeconds stats
         let bytes = fromIntegral (currentBytesUsed stats) :: Int
         lift . commLog . logInfo $
           sformat ("processContent at " % float % " got rawData of size " % int % " heap size is " % int) cpuTime (rawDataSize raw) bytes
