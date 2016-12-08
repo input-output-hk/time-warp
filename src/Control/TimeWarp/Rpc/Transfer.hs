@@ -109,7 +109,7 @@ import           Data.Text.Buildable                (Buildable (build), build)
 import           Data.Text.Encoding                 (decodeUtf8)
 import           Data.Typeable                      (Typeable)
 import           Formatting                         (bprint, builder, int, sformat, shown,
-                                                     stext, string, (%))
+                                                     stext, string, (%), float)
 import qualified Network.Socket                     as NS
 import           Serokell.Util.Base                 (inCurrentContext)
 import           Serokell.Util.Concurrent           (modifyTVarS)
@@ -133,6 +133,8 @@ import           Control.TimeWarp.Timed             (Microsecond, MonadTimed, Th
                                                      TimedIO, for, fork, fork_, interval,
                                                      forkLabeled, forkLabeled_,
                                                      killThread, sec, wait)
+import           GHC.Stats                          (getGCStats, GCStats(..))
+import           System.Mem                         (performGC)
 
 -- * Util
 
@@ -476,6 +478,11 @@ listenInbound (fromIntegral -> port) sink = do
 
     -- makes socket work, finishes once it's fully shutdown
     processSocket sock sf@SocketFrame{..} jc = do
+        () <- liftIO performGC
+        stats <- liftIO getGCStats
+        let cpuTime = gcCpuSeconds stats
+        let bytes = fromIntegral (bytesAllocated stats) :: Int
+        commLog . logInfo $ sformat ("Accpted connection at " % float % " bytes allocated " % int) cpuTime bytes
         liftIO $ NS.setSocketOption sock NS.ReuseAddr 1
 
         sfReceive sf sink

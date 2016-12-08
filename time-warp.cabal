@@ -85,6 +85,7 @@ library
   default-language:    Haskell2010
   ghc-options:         -Wall -fno-warn-orphans
                        -fprof-auto
+                       -fno-full-laziness
   default-extensions:  RecordWildCards
                        OverloadedStrings
                        DeriveDataTypeable
