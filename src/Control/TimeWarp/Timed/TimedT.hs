@@ -340,6 +340,8 @@ instance (CanLog m, MonadIO m, MonadThrow m, MonadCatch m) =>
         wait $ for 1 mcs  -- real `forkIO` seems to yield execution
                           -- to newly created thread
         return tid
+    -- TODO meaningful implementation
+    labelThread _ _ = pure ()
     wait relativeToNow = do
         cur <- virtualTime
         ctx <- TimedT ask

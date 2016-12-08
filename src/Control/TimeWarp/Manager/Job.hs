@@ -18,7 +18,9 @@ module Control.TimeWarp.Manager.Job
          -- * Manager utilities
        , addManagerAsJob
        , addSafeThreadJob
+       , addThreadJobGeneral
        , addThreadJob
+       , addThreadJobLabeled
        , interruptAllJobs
        , isInterrupted
        , mkJobCurator
@@ -45,7 +47,8 @@ import           Serokell.Util.Base          (inCurrentContext)
 import           Serokell.Util.Concurrent    (modifyTVarS, threadDelay)
 import           System.Wlog                 (CanLog)
 
-import           Control.TimeWarp.Timed      (Microsecond, MonadTimed, fork_, killThread,
+import           Control.TimeWarp.Timed      (Microsecond, MonadTimed, fork_,
+                                              forkLabeled_, killThread,
                                               myThreadId)
 
 -- | Unique identifier of job.
@@ -173,15 +176,26 @@ addManagerAsJob curator intType managerJob = do
         \(runMarker -> ready) -> fork_ $ awaitAllJobs managerJob >> liftIO ready
 
 -- | Adds job executing in another thread, where interrupting kills the thread.
-addThreadJob :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
-             => JobCurator -> m () -> m ()
-addThreadJob curator action =
+addThreadJobGeneral
+  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  => (m () -> m ()) -> JobCurator -> m () -> m ()
+addThreadJobGeneral howToFork curator action =
     mask $
-        \unmask -> fork_ $ do
+        \unmask -> howToFork $ do
             tid <- myThreadId
             killer <- inCurrentContext $ killThread tid
             addJob curator (JobInterrupter killer) $
                 \(runMarker -> markReady) -> unmask action `finally` liftIO markReady
+
+addThreadJob
+  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  => JobCurator -> m () -> m ()
+addThreadJob = addThreadJobGeneral fork_
+
+addThreadJobLabeled
+  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  => String -> JobCurator -> m () -> m ()
+addThreadJobLabeled label = addThreadJobGeneral (forkLabeled_ label)
 
 -- | Adds job executing in another thread, interrupting does nothing.
 -- Usefull then work stops itself on interrupt, and we just need to wait till it fully

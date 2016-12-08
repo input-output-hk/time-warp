@@ -34,6 +34,7 @@ import           Data.Time.Units                   (toMicroseconds)
 import           SlaveThread                       as ST
 import qualified System.Timeout                    as T
 import           System.Wlog                       (CanLog)
+import qualified GHC.Conc                          (labelThread)
 
 import           Control.TimeWarp.Timed.MonadTimed (Microsecond, MonadTimed (..),
                                                     MonadTimedError (MTTimeoutError),
@@ -66,6 +67,8 @@ instance MonadTimed TimedIO where
         liftIO $ C.threadDelay $ fromIntegral $ relativeToNow cur - cur
 
     fork (TimedIO a) = TimedIO $ lift . C.forkIO . runReaderT a =<< ask
+
+    labelThread tid name = liftIO $ GHC.Conc.labelThread tid name
 
     myThreadId = TimedIO $ lift $ C.myThreadId
 

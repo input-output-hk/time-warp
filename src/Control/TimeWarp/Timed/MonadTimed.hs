@@ -22,6 +22,7 @@ module Control.TimeWarp.Timed.MonadTimed
     , RelativeToNow
       -- * Helper functions
     , schedule, invoke, timestamp, fork_, work, killThread
+    , forkLabeled, forkLabeled_
     , startTimer
       -- ** Time measures
     , hour , minute , sec , ms , mcs
@@ -127,6 +128,9 @@ class MonadThrow m => MonadTimed m where
     -- | Creates another thread of execution, with same point of origin.
     fork :: m () -> m (ThreadId m)
 
+    -- | Associate a label with a thread.
+    labelThread :: ThreadId m -> String -> m ()
+
     -- | Acquires current thread id.
     myThreadId :: m (ThreadId m)
 
@@ -194,6 +198,16 @@ timestamp msg = virtualTime >>= \time -> liftIO . putStrLn $
 fork_ :: MonadTimed m => m () -> m ()
 fork_ = void . fork
 
+-- | Fork and label. Useful for debugging with GHC event log tools.
+forkLabeled :: MonadTimed m => String -> m () -> m (ThreadId m)
+forkLabeled name m = do
+  tid <- fork m
+  () <- labelThread tid name
+  pure tid
+
+forkLabeled_ :: MonadTimed m => String -> m () -> m ()
+forkLabeled_ name = void . forkLabeled name
+
 -- | Creates a thread, which works for specified amount of time, and then gets
 -- `killThread`ed.
 -- Use `for` to specify relative virtual time (counting from now),
@@ -216,6 +230,8 @@ instance MonadTimed m => MonadTimed (ReaderT r m) where
 
     fork m = lift . fork . runReaderT m =<< ask
 
+    labelThread label tid = lift (labelThread label tid)
+
     myThreadId = lift myThreadId
 
     throwTo tid = lift . throwTo tid
@@ -235,6 +251,8 @@ instance MonadTimed m => MonadTimed (StateT s m) where
     wait = lift . wait
 
     fork m = lift . fork . evalStateT m =<< get
+
+    labelThread label tid = lift (labelThread label tid)
 
     myThreadId = lift myThreadId
 
