@@ -314,32 +314,36 @@ mkSocketFrame settings sfPeerAddr = liftIO $ do
 sfSend :: (MonadIO m, WithLogger m)
        => SocketFrame -> Source m BS.ByteString -> m ()
 sfSend SocketFrame{..} src = do
-    lbs <- src $$ sinkLbs
-    logQueueState
-    (notifier, awaiter) <- mkMonitor
-    liftIO . atomically . TBM.writeTBMChan sfOutChan $ (lbs, atomically notifier)
-
-    -- wait till data get consumed by socket, but immediatelly quit on socket
-    -- get closed.
-    --
-    -- This will block until somebody hits 'notifier', or the job curator is
-    -- closed, so we must take care to ensure that, eventually, one of these
-    -- happens.
-    --
-    -- A note on the BlockedIndefinitelyOnSTM. This should come up in case
-    -- all other references to TVar in mkMonitor are lost. There's one other
-    -- reference, namely the one in the TBMChan that we wrote just above. So
-    -- if it's cleared from the queue and the notifier is not run, we should
-    -- get that exception. However, if it's not cleared from the queue, and
-    -- the SocketFrame is retained in some other thread, we'll just wait here.
     let jm = getJobCurator sfJobCurator
-    -- 'checkClosed' will retry if the job curator is not closed.
-    -- 'awaiter', as defined in 'mkMonitor', follows the same motif.
-    -- We combine them with 'orElse' to get an STM which will retry until
-    -- either the job curator is closed or the notifier is called.
-    let checkClosed = check =<< (view jcIsClosed <$> TV.readTVar jm)
-    let waitNotifyOrClose = const () <$> (checkClosed `orElse` awaiter)
-    liftIO . atomically $ waitNotifyOrClose
+    alreadyClosed <- liftIO . atomically $ view jcIsClosed <$> TV.readTVar jm
+    if alreadyClosed
+    then commLog . logWarning $ sformat ("sfSend : SocketFrame for " % shown % " is already closed") sfPeerAddr
+    else do
+        lbs <- src $$ sinkLbs
+        logQueueState
+        (notifier, awaiter) <- mkMonitor
+        liftIO . atomically . TBM.writeTBMChan sfOutChan $ (lbs, atomically notifier)
+
+        -- wait till data get consumed by socket, but immediatelly quit on socket
+        -- get closed.
+        --
+        -- This will block until somebody hits 'notifier', or the job curator is
+        -- closed, so we must take care to ensure that, eventually, one of these
+        -- happens.
+        --
+        -- A note on the BlockedIndefinitelyOnSTM. This should come up in case
+        -- all other references to TVar in mkMonitor are lost. There's one other
+        -- reference, namely the one in the TBMChan that we wrote just above. So
+        -- if it's cleared from the queue and the notifier is not run, we should
+        -- get that exception. However, if it's not cleared from the queue, and
+        -- the SocketFrame is retained in some other thread, we'll just wait here.
+        -- 'checkClosed' will retry if the job curator is not closed.
+        -- 'awaiter', as defined in 'mkMonitor', follows the same motif.
+        -- We combine them with 'orElse' to get an STM which will retry until
+        -- either the job curator is closed or the notifier is called.
+        let checkClosed = check =<< (view jcIsClosed <$> TV.readTVar jm)
+        let waitNotifyOrClose = const () <$> (checkClosed `orElse` awaiter)
+        liftIO . atomically $ waitNotifyOrClose
   where
     -- creates pair (@notifier@, @awaiter@), where @awaiter@ blocks thread
     -- until @notifier@ is called.
@@ -424,6 +428,11 @@ sfProcessSocket
   :: forall m . (MonadIO m, MonadMask m, MonadTimed m, WithLogger m)
   => SocketFrame -> NS.Socket -> m ()
 sfProcessSocket SocketFrame{..} sock = do
+    -- Time out and raise an exception after 3 seconds.
+    -- This is important. If we make a connection but the peer just leaves it
+    -- open and never tries to receive any data, our queues will back up and
+    -- our heap will balloon.
+    _ <- liftIO $ NS.setSocketOption sock NS.UserTimeout 3000
     -- TODO: rewrite to async when MonadTimed supports it
     -- create channel to notify about error
     eventChan  <- liftIO TC.newTChanIO
@@ -557,7 +566,7 @@ listenInbound (fromIntegral -> port) sink = do
             \unmask -> addThreadJobLabeled "listenInbound" serverJobCurator $
                 flip finally (liftIO $ NS.close lsocket) . unmask $
                     handleAll (logOnServerError serverJobCurator) $
-                        serve lsocket serverJobCurator
+                       serve lsocket serverJobCurator
     -- return closer
     inCurrentContext $ do
         commLog . logInfo $ sformat ("Stopping server at "%int) port
@@ -582,8 +591,8 @@ listenInbound (fromIntegral -> port) sink = do
       stats <- liftIO getGCStats
       let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
-      commLog . logInfo $ sformat ("Accepted connection at " % float % " current bytes allocated " % int) cpuTime bytes
       let readableAddr = buildSockAddr addr
+      commLog . logInfo $ sformat ("trace " % float % " " % int % " : accepted connection to " % stext) cpuTime bytes readableAddr
       liftIO . traceEventIO . T.unpack $ sformat ("START connection " % stext) readableAddr
       pure (sock, addr)
 
@@ -593,8 +602,8 @@ listenInbound (fromIntegral -> port) sink = do
       stats <- liftIO getGCStats
       let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
-      commLog . logInfo $ sformat ("Closed connection at " % float % " current bytes allocated " % int) cpuTime bytes
       let readableAddr = buildSockAddr addr
+      commLog . logInfo $ sformat ("trace " % float % " " % int % " : closed connection to " % stext) cpuTime bytes readableAddr
       liftIO . traceEventIO . T.unpack $ sformat ("STOP connection " %stext) readableAddr
       pure ()
 
@@ -707,7 +716,13 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
                 \sock -> do
                     commLog . logInfo $
                         sformat ("Established connection to "%stext) (sfPeerAddr sf)
-                    _ <- liftIO $ IR.atomicWriteIORef failsInRow 0
+                    -- NB we do *not* reset the failsInRow counter just because
+                    -- we have connected. It could be that, for instance, the
+                    -- peer accepts our connection but never tries to receive
+                    -- any data, in which case (due to UserTimeout) we would
+                    -- close the socket and try again forever, resetting the
+                    -- failure counter each time.
+                    -- _ <- liftIO $ IR.atomicWriteIORef failsInRow 0
                     sfProcessSocket sf sock
 
     -- Repeatedly try to establish a TCP connection, giving up after a set
@@ -740,6 +755,14 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
 
 
 instance MonadTransfer Transfer where
+    -- An idea for a simplification.
+    -- Why not just try to pull the SocketFrame itself from a pool (or create
+    -- anew if needed) and then send directly through it, blocking on the
+    -- send? It's no worse than what we have now, just simpler; currently
+    -- we still wait on send (via socketSink) but we do so indirectly, via
+    -- a notifier TVar which the sfProcessSink sending thread must call.
+    -- This alternative is safer. If the socket blows up, you'll hear about
+    -- it, because you're blocked on send.
     sendRaw addr src = do
         conn <- getOutConnOrOpen addr
         outConnSend conn src
