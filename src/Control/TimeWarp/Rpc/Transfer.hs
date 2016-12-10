@@ -141,32 +141,6 @@ import           System.IO.Unsafe                   (unsafePerformIO)
 
 -- * Util
 
--- A global mutable cell because we want to use it for incoming and outgoing
--- connections, but I don't want to change the Transfer monad.
-{-# NOINLINE totalInflow #-}
-totalInflow :: IR.IORef Int
-totalInflow = unsafePerformIO (IR.newIORef 0)
-
---sourceSocket' :: MonadIO m => IORef Integer -> Socket -> Producer m ByteString
-sourceSocket'
-  :: forall m .
-     ( CanLog m, HasLoggerName m, MonadIO m )
-  => IR.IORef Int
-  -> NS.Socket
-  -> Source m BS.ByteString
-sourceSocket' total socket =
-  loop
-  where
-  loop = do
-    bs <- lift $ liftIO $ safeRecv socket 4096
-    let bsSize = BS.length bs
-    if BS.null bs
-    then return ()
-    else do totalSoFar <- liftIO $ IR.atomicModifyIORef' total (\i -> let total = i + bsSize in (total, total))
-            () <- lift . commLog . logInfo $ sformat ("sourceSocket' total seen so far is " % int) totalSoFar
-            yield bs
-            loop
-
 -- | Like sinkTBMChan from the library but this one will log when the channel
 --   is full.
 sinkTBMChan'
@@ -192,7 +166,7 @@ sinkTBMChan' chan shouldClose = loop >> closer
             stats <- liftIO getGCStats
             let cpuTime = cpuSeconds stats
             let bytes = fromIntegral (currentBytesUsed stats) :: Int
-            lift . commLog . logInfo $ sformat ("sinkTBMChan' blocking on full channel at time " % float % " pending data of size " % int % " heap size is " % int) cpuTime bsSize bytes
+            lift . commLog . logInfo $ sformat ("trace cpuTime :" % float % ", bytes in heap: " % int % ". sinkTBMChan' blocking on full channel with pending data of size " % int) cpuTime bytes bsSize
             liftIO . atomically $ TBM.writeTBMChan chan x
             loop
           Just True -> loop
@@ -494,7 +468,7 @@ sfProcessSocket SocketFrame{..} sock = do
 
     foreverRec :: m ()
     foreverRec = do
-        sourceSocket' totalInflow sock $$ sinkTBMChan' sfInChan False
+        sourceSocket sock $$ sinkTBMChan' sfInChan False
         unlessInterrupted sfJobCurator $
             throwM PeerClosedConnection
 
@@ -583,16 +557,16 @@ listenInbound (fromIntegral -> port) sink = do
 
                     logNewInputConnection sfPeerAddr
                     unmask (processSocket sock sf serverJobCurator)
-                        `finally` liftIO (NS.close sock)
+                        `finally` (closeAndTrace (sock, addr))
 
     acceptAndTrace lsocket = do
-      (sock, addr) <- liftIO $ acceptSafe lsocket
+      (sock, addr) <- liftIO $ NS.accept lsocket
       () <- liftIO performGC
       stats <- liftIO getGCStats
       let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
       let readableAddr = buildSockAddr addr
-      commLog . logInfo $ sformat ("trace " % float % " " % int % " : accepted connection to " % stext) cpuTime bytes readableAddr
+      commLog . logInfo $ sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % " : accepted connection to " % stext) cpuTime bytes readableAddr
       liftIO . traceEventIO . T.unpack $ sformat ("START connection " % stext) readableAddr
       pure (sock, addr)
 
@@ -603,7 +577,7 @@ listenInbound (fromIntegral -> port) sink = do
       let cpuTime = cpuSeconds stats
       let bytes = fromIntegral (currentBytesUsed stats) :: Int
       let readableAddr = buildSockAddr addr
-      commLog . logInfo $ sformat ("trace " % float % " " % int % " : closed connection to " % stext) cpuTime bytes readableAddr
+      commLog . logInfo $ sformat ("trace cpuTime: " % float % " bytes in heap: " % int % " : closed connection to " % stext) cpuTime bytes readableAddr
       liftIO . traceEventIO . T.unpack $ sformat ("STOP connection " %stext) readableAddr
       pure ()
 
@@ -682,7 +656,7 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
             (conn, sfm) <- ensureConnExist
             forM_ (sfm :: Maybe SocketFrame) $
                 \sf -> addSafeThreadJob (sfJobCurator sf) $
-                    unmask (startWorker sf) `finally` releaseConn sf
+                    unmask (startWorker sf `finally` releaseConn sf)
             return conn
   where
     addrName = buildNetworkAddress addr
@@ -714,8 +688,12 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
                 (liftIO . NS.close) $
                 \sock -> do
+                    () <- liftIO performGC
+                    stats <- liftIO getGCStats
+                    let cpuTime = cpuSeconds stats
+                    let bytes = fromIntegral (currentBytesUsed stats) :: Int
                     commLog . logInfo $
-                        sformat ("Established connection to "%stext) (sfPeerAddr sf)
+                        sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % ". established connection to " % stext) cpuTime bytes (sfPeerAddr sf)
                     -- NB we do *not* reset the failsInRow counter just because
                     -- we have connected. It could be that, for instance, the
                     -- peer accepts our connection but never tries to receive
@@ -750,8 +728,12 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
     releaseConn sf = do
         interruptAllJobs (sfJobCurator sf) Plain
         modifyManager $ outputConn . at addr .= Nothing
+        () <- liftIO performGC
+        stats <- liftIO getGCStats
+        let cpuTime = cpuSeconds stats
+        let bytes = fromIntegral (currentBytesUsed stats) :: Int
         commLog . logInfo $
-            sformat ("Socket to "%stext%" closed") addrName
+            sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % ". released connection to " % stext) cpuTime bytes addrName
 
 
 instance MonadTransfer Transfer where
