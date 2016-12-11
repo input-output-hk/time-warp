@@ -533,6 +533,7 @@ listenInbound :: Port
               -> Sink BS.ByteString (ResponseT Transfer) ()
               -> Transfer (Transfer ())
 listenInbound (fromIntegral -> port) sink = do
+    commLog . logInfo $ sformat ("Starting server at "%int) port
     serverJobCurator <- mkJobCurator
     -- launch server
     bracketOnError (liftIO $ bindPortTCP port "*") (liftIO . NS.close) $
@@ -584,6 +585,7 @@ listenInbound (fromIntegral -> port) sink = do
     -- makes socket work, finishes once it's fully shutdown
     processSocket sock sf@SocketFrame{..} jc = do
         liftIO $ NS.setSocketOption sock NS.ReuseAddr 1
+        liftIO $ NS.setSocketOption sock NS.ReusePort 1
 
         -- sfReceive forks, does not block.
         -- It pulls data from the socket frame's in channel, which is fed by
@@ -651,16 +653,21 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
     -- and when the latter is released, 'interruptAllJobs' is called on that
     -- curator.
     --
-    mask $
-        \unmask -> do
-            (conn, sfm) <- ensureConnExist
-            forM_ (sfm :: Maybe SocketFrame) $
-                \sf -> addSafeThreadJob (sfJobCurator sf) $
-                    unmask (startWorker sf `finally` releaseConn sf)
-            return conn
+    do (conn, sfm) <- ensureConnExist
+       -- If it's a freshly minted 'SocketFrame' we'll spawn a thread to
+       -- hook its queues up to a TCP connection.
+       -- We release the 'SocketFrame' and its queues only if the worker
+       -- ends (normally or exceptionally).
+       forM_ (sfm :: Maybe SocketFrame) $
+           \sf -> addThreadJob (sfJobCurator sf) $
+               startWorker sf `finally` releaseConn sf
+       return conn
   where
     addrName = buildNetworkAddress addr
 
+    -- Checks a pool for an existing connection to the given address.
+    -- It gives an 'OutputConnection' always, and if it's new (not for an
+    -- existing connection) then its underlying 'SocketFrame' is also given.
     ensureConnExist = do
         settings <- Transfer ask
         let getOr m act = maybe act (return . (, Nothing)) m
@@ -734,7 +741,6 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         let bytes = fromIntegral (currentBytesUsed stats) :: Int
         commLog . logInfo $
             sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % ". released connection to " % stext) cpuTime bytes addrName
-
 
 instance MonadTransfer Transfer where
     -- An idea for a simplification.

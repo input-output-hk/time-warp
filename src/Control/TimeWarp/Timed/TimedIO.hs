@@ -80,6 +80,8 @@ instance MonadTimed TimedIO where
 
     forkSlave (TimedIO a) = TimedIO $ lift . ST.fork . runReaderT a =<< ask
 
+    mkWeakThreadId = TimedIO . lift . C.mkWeakThreadId
+
 -- | Launches scenario using real time and threads.
 runTimedIO :: TimedIO a -> IO a
 runTimedIO = (curTime >>= ) . runReaderT . getTimedIO

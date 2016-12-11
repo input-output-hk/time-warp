@@ -378,6 +378,8 @@ instance (CanLog m, MonadIO m, MonadThrow m, MonadCatch m) =>
         action' `finally` liftIO (writeIORef done True)
     forkSlave = undefined
 
+    mkWeakThreadId = error "mkWeakThreadId is not implemented"
+
 -- | Name which is used by logger (see `WithNamedLogger`) if no other one was specified.
 defaultLoggerName :: LoggerName
 defaultLoggerName = "emulation"

@@ -49,7 +49,8 @@ import           System.Wlog                 (CanLog)
 
 import           Control.TimeWarp.Timed      (Microsecond, MonadTimed, fork_,
                                               forkLabeled_, killThread,
-                                              myThreadId)
+                                              myThreadId, mkWeakThreadId)
+import qualified System.Mem.Weak             as Weak
 
 -- | Unique identifier of job.
 newtype JobId = JobId Word
@@ -183,7 +184,18 @@ addThreadJobGeneral howToFork curator action =
     mask $
         \unmask -> howToFork $ do
             tid <- myThreadId
-            killer <- inCurrentContext $ killThread tid
+            -- This thread's ThreadId is *not* retained by the job manager.
+            -- That's important. A GHC 'ThreadId' contains a pointer to the
+            -- thread itself. If we retain the 'ThreadId', the thread is
+            -- retained as well, and will also never receive blocked
+            -- indefinitely exceptions, meaning deadlock in our system could
+            -- manifest in, for instance, a massive and growing heap.
+            wtid <- mkWeakThreadId tid
+            killer <- inCurrentContext $ do
+                mtid <- liftIO . Weak.deRefWeak $ wtid
+                case mtid of
+                  Just tid -> killThread tid
+                  Nothing -> pure ()
             addJob curator (JobInterrupter killer) $
                 \(runMarker -> markReady) -> unmask action `finally` liftIO markReady
 

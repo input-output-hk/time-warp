@@ -62,6 +62,7 @@ import           Data.Time.Units      (Microsecond, Millisecond, Minute, Second,
                                        TimeUnit (..), convertUnit)
 import           Data.Typeable        (Typeable)
 import           System.Wlog          (LoggerNameBox (..))
+import           System.Mem.Weak      (Weak)
 
 -- | Defines some time point basing on current virtual time.
 type RelativeToNow = Microsecond -> Microsecond
@@ -143,6 +144,10 @@ class MonadThrow m => MonadTimed m where
 
     -- | From `slave-thread` library.
     forkSlave :: m () -> m (ThreadId m)
+
+    -- | Make a weak reference to the `ThreadId` such that it will be kept
+    --   alive as long as the thread itself is running.
+    mkWeakThreadId :: ThreadId m -> m (Weak (ThreadId m))
 
 -- | Type of thread identifier.
 type family ThreadId (m :: * -> *) :: *
@@ -240,6 +245,7 @@ instance MonadTimed m => MonadTimed (ReaderT r m) where
 
     forkSlave m = lift . forkSlave . runReaderT m =<< ask
 
+    mkWeakThreadId = lift . mkWeakThreadId
 
 type instance ThreadId (StateT s m) = ThreadId m
 
@@ -262,6 +268,7 @@ instance MonadTimed m => MonadTimed (StateT s m) where
 
     forkSlave m = lift . forkSlave . evalStateT m =<< get
 
+    mkWeakThreadId = lift . mkWeakThreadId
 
 deriving instance MonadTimed m => MonadTimed (LoggerNameBox m)
 
