@@ -586,12 +586,11 @@ listenInbound (fromIntegral -> port) sink = do
     processSocket sock sf@SocketFrame{..} jc = do
         liftIO $ NS.setSocketOption sock NS.ReuseAddr 1
         liftIO $ NS.setSocketOption sock NS.ReusePort 1
-
         -- sfReceive forks, does not block.
         -- It pulls data from the socket frame's in channel, which is fed by
         -- the socket (see sfProcessSocket).
-        sfReceive sf sink
-        unlessInterrupted jc $
+        unlessInterrupted jc $ do
+            sfReceive sf sink
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
                 -- sfProcessSocket blocks until it gets an event.
                 sfProcessSocket sf sock
