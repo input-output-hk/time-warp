@@ -116,7 +116,8 @@ import           Serokell.Util.Base                 (inCurrentContext)
 import           Serokell.Util.Concurrent           (modifyTVarS)
 import           System.Wlog                        (CanLog, HasLoggerName, LoggerNameBox,
                                                      Severity (..), WithLogger, logDebug,
-                                                     logInfo, logMessage, logWarning)
+                                                     logInfo, logMessage, logWarning,
+                                                     logError)
 
 import           Control.TimeWarp.Manager           (InterruptType (..), JobCurator (..),
                                                      addManagerAsJob, addSafeThreadJob,
@@ -144,12 +145,13 @@ import           System.IO.Unsafe                   (unsafePerformIO)
 -- | Like sinkTBMChan from the library but this one will log when the channel
 --   is full.
 sinkTBMChan'
-  :: forall m .
-     ( CanLog m, HasLoggerName m, MonadIO m )
-  => TBM.TBMChan BS.ByteString
+  :: forall m msg .
+     ( Show msg, CanLog m, HasLoggerName m, MonadIO m )
+  => msg
+  -> TBM.TBMChan BS.ByteString
   -> Bool
   -> Sink BS.ByteString m ()
-sinkTBMChan' chan shouldClose = loop >> closer
+sinkTBMChan' msg chan shouldClose = loop >> closer
   where
   loop = do
     maybeNext <- await
@@ -162,11 +164,8 @@ sinkTBMChan' chan shouldClose = loop >> closer
           Just False -> do
             -- Log and then do a potentially blocking write
             let bsSize = BS.length x
-            () <- liftIO performGC
-            stats <- liftIO getGCStats
-            let cpuTime = cpuSeconds stats
-            let bytes = fromIntegral (currentBytesUsed stats) :: Int
-            lift . commLog . logInfo $ sformat ("trace cpuTime :" % float % ", bytes in heap: " % int % ". sinkTBMChan' blocking on full channel with pending data of size " % int) cpuTime bytes bsSize
+            lift . commLog . logInfo $
+                sformat ("sinkTBMChan' blocking on full channel with pending data of size " % int % ". " % shown) bsSize msg
             liftIO . atomically $ TBM.writeTBMChan chan x
             loop
           Just True -> loop
@@ -343,23 +342,45 @@ sfReceive :: (MonadIO m, MonadMask m, MonadTimed m, WithLogger m,
               MonadBaseControl IO m)
           => SocketFrame -> Sink BS.ByteString (ResponseT m) () -> m ()
 sfReceive sf@SocketFrame{..} sink = do
+    -- This is dubious. What if we give a different Sink from the last
+    -- use of sfReceive?
     busy <- liftIO . atomically $ TV.swapTVar sfInBusy True
     when busy $ throwM $ AlreadyListeningOutbound sfPeerAddr
 
     liManager <- mkJobCurator
     onTimeout <- inCurrentContext logOnInterruptTimeout
     let interruptType = WithTimeout (interval 3 sec) onTimeout
-    mask $ \unmask -> do
-        addManagerAsJob sfJobCurator interruptType liManager
-        addThreadJobLabeled "sourceTBMChan" liManager $ unmask $ logOnErr $ do  -- TODO: reconnect on error?
-            (sourceTBMChan sfInChan $$ sink) `runResponseT` sfMkResponseCtx sf
-            logListeningHappilyStopped
+    addManagerAsJob sfJobCurator interruptType liManager
+    -- FIXME
+    --
+    -- it is observed that this thread repeatedly dies because it's blocked
+    -- indefinitely on an STM transaction. Surely that's to say, the
+    -- sfInChan is not reachable from any other thread. How could this
+    -- come about? The SocketFrame must be removed from the pool, but that
+    -- happens only if the connection times out, no?
+    --
+    -- We also observe that sinkTBMChan' regularly blocks on a full channel.
+    -- Right here, in 'sfReceive', seems to be the only place where we
+    -- clear that channel. But if the other thread is blocked on that chan,
+    -- then this thread wouldn't die due to blocked indefinitely; rather, it
+    -- would take from the chan and dump to the socket.
+    --
+    -- It could be that the sink throws that exception. When applied to the
+    -- pos prototype, the sink is running nontrivial listeners, and it's
+    -- plausible that one of these could get blocked on STM.
+    --
+    -- Anyway, if we get an exception here, can we simply interruptAllJobs?
+    -- Will that cause the in and out channels to be collected?
+    addThreadJobLabeled "sourceTBMChan" liManager $ logOnErr $ threadJob
     pure ()
   where
-    logOnErr = handleAll $ \e ->
-        unlessInterrupted sfJobCurator $ do
-            commLog . logWarning $ sformat ("Server error: "%shown) e
-            interruptAllJobs sfJobCurator Plain
+    threadJob = do
+        (sourceTBMChan sfInChan $$ sink) `runResponseT` sfMkResponseCtx sf
+        logListeningHappilyStopped
+
+    logOnErr = handleAll $ \e -> do
+        commLog . logWarning $ sformat ("Server error: " % shown) e
+        unlessInterrupted sfJobCurator $ interruptAllJobs sfJobCurator Plain
 
     logOnInterruptTimeout = commLog . logInfo $
         sformat ("While closing socket to "%stext%" listener "%
@@ -420,55 +441,62 @@ sfProcessSocket SocketFrame{..} sock = do
     ctid <- fork $ do
         let jm = getJobCurator sfJobCurator
         liftIO . atomically $ check . view jcIsClosed =<< TV.readTVar jm
-        liftIO . atomically $
-            TC.writeTChan eventChan $ Right ()
-        -- NB the thread which didn't finish will get a ThreadKilled
-        -- exception and it'll crop up in the chan via reportErrors.
-        mapM_ killThread [stid, rtid]
-    -- wait for error messages
-    let onError e = do
-            mapM_ killThread [stid, rtid, ctid]
-            throwM e
-    event <- liftIO . atomically $ TC.readTChan eventChan
+        liftIO . atomically $ TC.writeTChan eventChan $ Right ()
+    let exceptionHandler = \e -> do
+            logError $ sformat ("sfProcessSocket : error while waiting for signal " % shown) e
+            pure (Left e)
+    event <- (liftIO . atomically $ TC.readTChan eventChan) `catchAll` exceptionHandler
+    -- NB the thread which didn't finish will get a ThreadKilled
+    -- exception and it'll crop up in the chan via reportErrors.
+    mapM_ killThread [stid, rtid, ctid]
     commLog . logInfo $ sformat ("Stop processing socket to "%stext) sfPeerAddr
     -- Left - worker error, Right - get closed
-    either onError return event
+    either throwM return event
     -- at this point workers are stopped
   where
-    foreverSend =
-        mask $ \unmask -> do
-            datm <- liftIO . atomically $ TBM.readTBMChan sfOutChan
-            forM_ datm $
-                \dat@(bs, notif) -> do
-                    -- Potential issue here.
-                    -- Here's what we previously had:
-                    --
-                    --let pushback = liftIO . atomically $ TBM.unGetTBMChan sfOutChan dat
-                    --unmask (sourceLbs bs $$ sinkSocket sock) `onException` pushback
-                    --
-                    -- Here we drop the data which failed to send. Perhaps we
-                    -- could still hold onto it (TBM.unGetTBMChan) so long as
-                    -- we expect that, after some reasonable amount of time,
-                    -- the data will either go down the wire, or we'll give up
-                    -- and let it be collected.
-                    let logException = commLog . logInfo $
-                          sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
-                    unmask $ (sourceLbs bs $$ sinkSocket sock) `onException` logException
-                    -- TODO: if get async exception here   ^, will send msg twice
-                    --
-                    -- FIXME ?
-                    -- If an exception is raised, we don't call notif.
-                    -- Does this mean that an sfSend on this frame (which sinks
-                    -- to sfOutChan) will block indefinitely? The notifier is
-                    -- still alive (in the TBMChan, we push it back on), so GHC
-                    -- wouldn't say blocked indefinitely on an STM unless the
-                    -- SocketFrame itself goes away.
-                    liftIO notif
-                    foreverSend
+    foreverSend = do
+        datm <- liftIO . atomically $ TBM.readTBMChan sfOutChan
+        forM_ datm $
+            \dat@(bs, notif) -> do
+                -- Potential issue here.
+                -- Here's what we previously had:
+                --
+                --let pushback = liftIO . atomically $ TBM.unGetTBMChan sfOutChan dat
+                --unmask (sourceLbs bs $$ sinkSocket sock) `onException` pushback
+                --
+                -- Here we drop the data which failed to send. Perhaps we
+                -- could still hold onto it (TBM.unGetTBMChan) so long as
+                -- we expect that, after some reasonable amount of time,
+                -- the data will either go down the wire, or we'll give up
+                -- and let it be collected.
+                let logException = commLog . logInfo $
+                      sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
+                (sourceLbs bs $$ sinkSocket sock) `onException` logException
+                -- TODO: if get async exception here   ^, will send msg twice
+                --
+                -- FIXME ?
+                -- If an exception is raised, we don't call notif.
+                -- Does this mean that an sfSend on this frame (which sinks
+                -- to sfOutChan) will block indefinitely? The notifier is
+                -- still alive (in the TBMChan, we push it back on), so GHC
+                -- wouldn't say blocked indefinitely on an STM unless the
+                -- SocketFrame itself goes away.
+                liftIO notif
+                foreverSend
 
     foreverRec :: m ()
     foreverRec = do
-        sourceSocket sock $$ sinkTBMChan' sfInChan False
+        -- FIXME
+        -- it is observed that sinkTBMChan' often blocks on a full channel.
+        -- This is bad. It means we'll happily pull data in from the socket even
+        -- though we have nowhere to put it, and our heap will grow as big as an
+        -- attacker would like for it to grow.
+        --
+        -- Who is clearing 'sfInChan'? 'sfReceive' is, and it's using a sink
+        -- provided by the user. We observe that the conduit in 'sfReceive'
+        -- blocks indefinitely on an STM. Perhaps it's not the channel which
+        -- causes the exception.
+        sourceSocket sock $$ sinkTBMChan' sfPeerAddr sfInChan False
         unlessInterrupted sfJobCurator $
             throwM PeerClosedConnection
 
@@ -537,11 +565,10 @@ listenInbound (fromIntegral -> port) sink = do
     serverJobCurator <- mkJobCurator
     -- launch server
     bracketOnError (liftIO $ bindPortTCP port "*") (liftIO . NS.close) $
-        \lsocket -> mask $
-            \unmask -> addThreadJobLabeled "listenInbound" serverJobCurator $
-                flip finally (liftIO $ NS.close lsocket) . unmask $
-                    handleAll (logOnServerError serverJobCurator) $
-                       serve lsocket serverJobCurator
+        \lsocket -> addThreadJobLabeled "listenInbound" serverJobCurator $
+            flip finally (liftIO $ NS.close lsocket) $
+                handleAll (logOnServerError serverJobCurator) $
+                   serve lsocket serverJobCurator
     -- return closer
     inCurrentContext $ do
         commLog . logInfo $ sformat ("Stopping server at "%int) port
@@ -550,15 +577,14 @@ listenInbound (fromIntegral -> port) sink = do
   where
     serve lsocket serverJobCurator = forever $
         bracketOnError (acceptAndTrace lsocket) closeAndTrace $
-            \(sock, addr) -> mask $
-                \unmask -> forkLabeled_ "listenInbound accepted connection" $ do
-                    settings <- Transfer ask
-                    sf@SocketFrame{..} <- mkSocketFrame settings $ buildSockAddr addr
-                    addManagerAsJob serverJobCurator Plain sfJobCurator
+            \(sock, addr) -> forkLabeled_ "listenInbound accepted connection" $ do
+                settings <- Transfer ask
+                sf@SocketFrame{..} <- mkSocketFrame settings $ buildSockAddr addr
+                addManagerAsJob serverJobCurator Plain sfJobCurator
 
-                    logNewInputConnection sfPeerAddr
-                    unmask (processSocket sock sf serverJobCurator)
-                        `finally` (closeAndTrace (sock, addr))
+                logNewInputConnection sfPeerAddr
+                (processSocket sock sf serverJobCurator)
+                    `finally` (closeAndTrace (sock, addr))
 
     acceptAndTrace lsocket = do
       (sock, addr) <- liftIO $ NS.accept lsocket
@@ -593,6 +619,12 @@ listenInbound (fromIntegral -> port) sink = do
             sfReceive sf sink
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
                 -- sfProcessSocket blocks until it gets an event.
+                --
+                -- NB 'sfProcessSocket' will pull from the socket into the
+                -- 'sfInChan' and also pull from 'sfOutChan' into the socket.
+                -- But 'sfOutChan' in practice will never be fed any data, for
+                -- we're merely *listening* on this 'SocketFrame'.
+                -- This shouldn't leak memory, though.
                 sfProcessSocket sf sock
                 logInputConnHappilyClosed sfPeerAddr
 
@@ -657,6 +689,11 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
        -- hook its queues up to a TCP connection.
        -- We release the 'SocketFrame' and its queues only if the worker
        -- ends (normally or exceptionally).
+       --
+       -- FIXME 'addSafeThreadJob' is perhaps not appropriate.
+       -- This variant uses an "interrupter" which does nothing, so
+       -- interrupting all jobs will not kill the thread and release the
+       -- connection as it would if we chose 'addThreadJob'
        forM_ (sfm :: Maybe SocketFrame) $
            \sf -> addThreadJob (sfJobCurator sf) $
                startWorker sf `finally` releaseConn sf
@@ -694,12 +731,8 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
                 (liftIO . NS.close) $
                 \sock -> do
-                    () <- liftIO performGC
-                    stats <- liftIO getGCStats
-                    let cpuTime = cpuSeconds stats
-                    let bytes = fromIntegral (currentBytesUsed stats) :: Int
                     commLog . logInfo $
-                        sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % ". established connection to " % stext) cpuTime bytes (sfPeerAddr sf)
+                        sformat ("established connection to " % stext) (sfPeerAddr sf)
                     -- NB we do *not* reset the failsInRow counter just because
                     -- we have connected. It could be that, for instance, the
                     -- peer accepts our connection but never tries to receive
@@ -732,14 +765,12 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
                     withRecovery sf failsInRow
 
     releaseConn sf = do
+        commLog . logInfo $
+            sformat ("releasing connection to " % stext) addrName
         interruptAllJobs (sfJobCurator sf) Plain
         modifyManager $ outputConn . at addr .= Nothing
-        () <- liftIO performGC
-        stats <- liftIO getGCStats
-        let cpuTime = cpuSeconds stats
-        let bytes = fromIntegral (currentBytesUsed stats) :: Int
         commLog . logInfo $
-            sformat ("trace cpuTime: " % float % ", bytes in heap: " % int % ". released connection to " % stext) cpuTime bytes addrName
+            sformat ("successfully released connection to " % stext) addrName
 
 instance MonadTransfer Transfer where
     -- An idea for a simplification.
