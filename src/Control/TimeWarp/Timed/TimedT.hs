@@ -380,6 +380,8 @@ instance (CanLog m, MonadIO m, MonadThrow m, MonadCatch m) =>
 
     mkWeakThreadId = error "mkWeakThreadId is not implemented"
 
+    showThreadId _ = show
+
 -- | Name which is used by logger (see `WithNamedLogger`) if no other one was specified.
 defaultLoggerName :: LoggerName
 defaultLoggerName = "emulation"

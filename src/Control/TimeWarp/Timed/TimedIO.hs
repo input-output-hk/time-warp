@@ -82,6 +82,8 @@ instance MonadTimed TimedIO where
 
     mkWeakThreadId = TimedIO . lift . C.mkWeakThreadId
 
+    showThreadId _ = show
+
 -- | Launches scenario using real time and threads.
 runTimedIO :: TimedIO a -> IO a
 runTimedIO = (curTime >>= ) . runReaderT . getTimedIO

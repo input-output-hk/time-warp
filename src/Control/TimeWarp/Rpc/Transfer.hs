@@ -768,6 +768,8 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         commLog . logInfo $
             sformat ("releasing connection to " % stext) addrName
         interruptAllJobs (sfJobCurator sf) Plain
+        commLog . logInfo $
+            sformat ("almost released connection to " % stext) addrName
         modifyManager $ outputConn . at addr .= Nothing
         commLog . logInfo $
             sformat ("successfully released connection to " % stext) addrName

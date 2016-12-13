@@ -4,6 +4,7 @@
 {-# LANGUAGE StandaloneDeriving    #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 
 -- |
 -- Module      : Control.TimeWarp.Timed.MonadTimed
@@ -63,6 +64,7 @@ import           Data.Time.Units      (Microsecond, Millisecond, Minute, Second,
 import           Data.Typeable        (Typeable)
 import           System.Wlog          (LoggerNameBox (..))
 import           System.Mem.Weak      (Weak)
+import           Data.Proxy           (Proxy(Proxy))
 
 -- | Defines some time point basing on current virtual time.
 type RelativeToNow = Microsecond -> Microsecond
@@ -106,7 +108,7 @@ instance Buildable MonadTimedError where
 -- first.
 
 
-class MonadThrow m => MonadTimed m where
+class (MonadThrow m) => MonadTimed m where
     -- | Acquires virtual time.
     virtualTime :: m Microsecond
 
@@ -148,6 +150,8 @@ class MonadThrow m => MonadTimed m where
     -- | Make a weak reference to the `ThreadId` such that it will be kept
     --   alive as long as the thread itself is running.
     mkWeakThreadId :: ThreadId m -> m (Weak (ThreadId m))
+
+    showThreadId :: Proxy m -> ThreadId m -> String
 
 -- | Type of thread identifier.
 type family ThreadId (m :: * -> *) :: *
@@ -247,6 +251,8 @@ instance MonadTimed m => MonadTimed (ReaderT r m) where
 
     mkWeakThreadId = lift . mkWeakThreadId
 
+    showThreadId _ = showThreadId (Proxy :: Proxy m)
+
 type instance ThreadId (StateT s m) = ThreadId m
 
 instance MonadTimed m => MonadTimed (StateT s m) where
@@ -269,6 +275,8 @@ instance MonadTimed m => MonadTimed (StateT s m) where
     forkSlave m = lift . forkSlave . evalStateT m =<< get
 
     mkWeakThreadId = lift . mkWeakThreadId
+
+    showThreadId _ = showThreadId (Proxy :: Proxy m)
 
 deriving instance MonadTimed m => MonadTimed (LoggerNameBox m)
 

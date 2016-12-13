@@ -2,6 +2,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE ViewPatterns          #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 
 -- | This module provides abstractions for parallel job processing.
 
@@ -45,12 +46,15 @@ import           Data.HashMap.Strict         (HashMap)
 import qualified Data.HashMap.Strict         as HM hiding (HashMap)
 import           Serokell.Util.Base          (inCurrentContext)
 import           Serokell.Util.Concurrent    (modifyTVarS, threadDelay)
-import           System.Wlog                 (CanLog)
+import           System.Wlog                 (CanLog, HasLoggerName, logInfo)
+import           Formatting                  (sformat, (%), string)
 
 import           Control.TimeWarp.Timed      (Microsecond, MonadTimed, fork_,
                                               forkLabeled_, killThread,
-                                              myThreadId, mkWeakThreadId)
+                                              myThreadId, mkWeakThreadId,
+                                              showThreadId)
 import qualified System.Mem.Weak             as Weak
+import           Data.Proxy                  (Proxy(Proxy))
 
 -- | Unique identifier of job.
 newtype JobId = JobId Word
@@ -178,34 +182,38 @@ addManagerAsJob curator intType managerJob = do
 
 -- | Adds job executing in another thread, where interrupting kills the thread.
 addThreadJobGeneral
-  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  :: forall m .
+     (CanLog m, HasLoggerName m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
   => (m () -> m ()) -> JobCurator -> m () -> m ()
-addThreadJobGeneral howToFork curator action =
-    mask $
-        \unmask -> howToFork $ do
-            tid <- myThreadId
-            -- This thread's ThreadId is *not* retained by the job manager.
-            -- That's important. A GHC 'ThreadId' contains a pointer to the
-            -- thread itself. If we retain the 'ThreadId', the thread is
-            -- retained as well, and will also never receive blocked
-            -- indefinitely exceptions, meaning deadlock in our system could
-            -- manifest in, for instance, a massive and growing heap.
-            wtid <- mkWeakThreadId tid
-            killer <- inCurrentContext $ do
-                mtid <- liftIO . Weak.deRefWeak $ wtid
-                case mtid of
-                  Just tid -> killThread tid
-                  Nothing -> pure ()
-            addJob curator (JobInterrupter killer) $
-                \(runMarker -> markReady) -> unmask action `finally` liftIO markReady
+addThreadJobGeneral howToFork curator action = howToFork $ do
+    tid <- myThreadId
+    -- This thread's ThreadId is *not* retained by the job manager.
+    -- That's important. A GHC 'ThreadId' contains a pointer to the
+    -- thread itself. If we retain the 'ThreadId', the thread is
+    -- retained as well, and will also never receive blocked
+    -- indefinitely exceptions, meaning deadlock in our system could
+    -- manifest in, for instance, a massive and growing heap.
+    wtid <- mkWeakThreadId tid
+    killer <- inCurrentContext $ do
+        mtid <- liftIO . Weak.deRefWeak $ wtid
+        case mtid of
+            Just tid -> do
+                logInfo $ sformat ("JobCurator : interrupting thread with id " % string) (showThreadId (Proxy :: Proxy m) tid)
+                killThread tid
+                logInfo $ sformat ("JobCurator : interrupted thread with id " % string) (showThreadId (Proxy :: Proxy m) tid)
+            Nothing -> do
+                logInfo $ "JobCurator : interrupting dead thread is no-op"
+                pure ()
+    addJob curator (JobInterrupter killer) $
+        \(runMarker -> markReady) -> action `finally` liftIO markReady
 
 addThreadJob
-  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  :: (CanLog m, HasLoggerName m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
   => JobCurator -> m () -> m ()
 addThreadJob = addThreadJobGeneral fork_
 
 addThreadJobLabeled
-  :: (CanLog m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
+  :: (CanLog m, HasLoggerName m, MonadIO m,  MonadMask m, MonadTimed m, MonadBaseControl IO m)
   => String -> JobCurator -> m () -> m ()
 addThreadJobLabeled label = addThreadJobGeneral (forkLabeled_ label)
 
@@ -213,10 +221,8 @@ addThreadJobLabeled label = addThreadJobGeneral (forkLabeled_ label)
 -- Usefull then work stops itself on interrupt, and we just need to wait till it fully
 -- stops.
 addSafeThreadJob :: (MonadIO m,  MonadMask m, MonadTimed m) => JobCurator -> m () -> m ()
-addSafeThreadJob curator action =
-    mask $
-        \unmask -> fork_ $ addJob curator (JobInterrupter $ return ()) $
-            \(runMarker -> markReady) -> unmask action `finally` liftIO markReady
+addSafeThreadJob curator action = fork_ $ addJob curator (JobInterrupter $ return ()) $
+    \(runMarker -> markReady) -> action `finally` liftIO markReady
 
 isInterrupted :: MonadIO m => JobCurator -> m Bool
 isInterrupted = liftIO . atomically . fmap (view jcIsClosed) . readTVar . getJobCurator
