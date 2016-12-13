@@ -725,9 +725,9 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
         failsInRow <- liftIO $ IR.newIORef 0
         commLog . logInfo $ sformat ("Lively socket to "%stext%" created, processing")
             (sfPeerAddr sf)
-        withRecovery sf failsInRow
+        establishConn sf
 
-    establishConn sf failsInRow =
+    establishConn sf =
         bracket (liftIO $ fst <$> getSocketFamilyTCP host port NS.AF_UNSPEC)
                 (liftIO . NS.close) $
                 \sock -> do
@@ -744,6 +744,16 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
 
     -- Repeatedly try to establish a TCP connection, giving up after a set
     -- number of exceptions as determined by the 'Settings' of this 'Transfer'
+    --
+    -- FIXME
+    -- removed this because it's catching everything. That includes of course
+    -- the ThreadKilled exception. 'interruptAllJobs' on the 'SocketFrame's
+    -- curator will try to kill this (it's added as a thread job) but killing
+    -- it will only make it try to reconnect.
+    -- This is a problem, but it does not explain the blocking on
+    -- interruptAllJobs.
+    -- Or does it...? 
+    {-
     withRecovery sf failsInRow = catchAll (establishConn sf failsInRow) $ \e -> do
         closed <- isInterrupted (sfJobCurator sf)
         unless closed $ do
@@ -763,14 +773,31 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
                         sformat ("Reconnect to "%shown%" in "%shown) addr delay
                     wait (for delay)
                     withRecovery sf failsInRow
+    -}
 
+    -- FIXME Here is a race.
+    --
+    -- While 'interruptAllJobs' does its thing, some other thread may use
+    -- 'getOutputConnOrOpen' at the same address, which will give the same
+    -- 'SocketFrame' used here (known as 'sf'), for it has not yet been
+    -- purged from the connection pool.
+    --
+    -- It's observed that 'interruptAllJobs' in fact blocks indefinitely (so
+    -- that "amost released connection to" is never logged). It's not clear yet
+    -- why this happens, but it makes this problem even more egregious. It means
+    -- that at most one "lively socket" to a particular peer address can be
+    -- created, and if it chokes up or dies or even closes normally, no other
+    -- user of this system will be able to send data to this peer.
+    --
+    -- A partial solution? Would it suffice to move the connection pool update
+    -- to go before 'interruptAllJobs'?
     releaseConn sf = do
         commLog . logInfo $
             sformat ("releasing connection to " % stext) addrName
-        interruptAllJobs (sfJobCurator sf) Plain
+        modifyManager $ outputConn . at addr .= Nothing
         commLog . logInfo $
             sformat ("almost released connection to " % stext) addrName
-        modifyManager $ outputConn . at addr .= Nothing
+        interruptAllJobs (sfJobCurator sf) Plain
         commLog . logInfo $
             sformat ("successfully released connection to " % stext) addrName
 

@@ -198,6 +198,11 @@ addThreadJobGeneral howToFork curator action = howToFork $ do
         mtid <- liftIO . Weak.deRefWeak $ wtid
         case mtid of
             Just tid -> do
+                -- FIXME
+                -- It's observed that not every "interrupting" log is followed
+                -- by an "interrupted" log! How could this be? 'killThread'
+                -- will block in case the target thread has async exceptions
+                -- masked.
                 logInfo $ sformat ("JobCurator : interrupting thread with id " % string) (showThreadId (Proxy :: Proxy m) tid)
                 killThread tid
                 logInfo $ sformat ("JobCurator : interrupted thread with id " % string) (showThreadId (Proxy :: Proxy m) tid)
