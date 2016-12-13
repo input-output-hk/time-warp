@@ -11,6 +11,7 @@
 {-# LANGUAGE TupleSections             #-}
 {-# LANGUAGE TypeFamilies              #-}
 {-# LANGUAGE UndecidableInstances      #-}
+{-# LANGUAGE ScopedTypeVariables       #-}
 
 -- |
 -- Module      : Control.TimeWarp.Rpc.MonadDialog
@@ -94,8 +95,9 @@ import           Control.Monad.Trans.Control        (ComposeSt, MonadBaseControl
                                                      defaultLiftBaseWith, defaultLiftWith,
                                                      defaultRestoreM, defaultRestoreT)
 import           Control.Monad.IO.Class             (liftIO, MonadIO)
+import qualified Data.ByteString                    as BS
 import           Data.Binary                        (Binary)
-import           Data.Conduit                       (yield, (=$=))
+import           Data.Conduit                       (yield, (=$=), Conduit, Sink)
 import qualified Data.Conduit.List                  as CL
 import           Data.Map                           as M
 import           Data.Proxy                         (Proxy (..))
@@ -261,59 +263,67 @@ listenP packing binding listeners = listenHP packing binding $ convert <$> liste
     second ((), r) = r
 
 -- | Similar to `listenH`.
-listenHP :: (Unpackable p (HeaderNRawData h),
-             MonadListener m)
-         => p -> Binding -> [ListenerH p h m] -> m (m ())
+listenHP
+    :: (Unpackable p (HeaderNRawData h), MonadListener m)
+    => p -> Binding -> [ListenerH p h m] -> m (m ())
 listenHP packing binding listeners =
     listenRP packing binding listeners (const $ return True)
 
 -- | Similar to `listenR`.
-listenRP :: (Unpackable p (HeaderNRawData h), MonadListener m)
-         => p -> Binding -> [ListenerH p h m] -> ListenerR h m -> m (m ())
-listenRP packing binding listeners rawListener = listenRaw binding loop
+listenRP
+    :: forall p h m .
+       (Unpackable p (HeaderNRawData h), MonadListener m)
+    => p -> Binding -> [ListenerH p h m] -> ListenerR h m -> m (m ())
+listenRP packing binding listeners rawListener = listenRaw binding conduit 
   where
 
     -- A conduit to consume some output provided under the hood by listenRaw.
     -- In practice the inflow comes from a TCP connection.
-    loop =
+    conduit :: Sink BS.ByteString (ResponseT m) ()
+    conduit = unpack =$= processContentConduit
         -- [TW-92] Review exception handling on `listen`
         -- do we catch exception here? Do we close conduit properly?
-        unpackMsg packing =$= CL.head >>= mapM_ processContent
+        -- (unpackMsg packing =$= CL.head) >>= mapM_ processContent
 
+    unpack :: Conduit BS.ByteString (ResponseT m) (HeaderNRawData h)
+    unpack = unpackMsg packing
+
+    processContentConduit :: Sink (HeaderNRawData h) (ResponseT m) ()
+    processContentConduit = CL.mapM_ processContent
+
+    processContent :: HeaderNRawData h -> ResponseT m ()
     processContent rawMsg@(HeaderNRawData header raw) = {-# SCC processContent #-} do
-        --() <- pure (traceEvent ("processContent rawData of size : " ++ show (rawDataSize raw)) ())
         () <- liftIO performGC
         stats <- liftIO getGCStats
         let cpuTime = cpuSeconds stats
         let bytes = fromIntegral (currentBytesUsed stats) :: Int
         lift . commLog . logInfo $
           sformat ("processContent at " % float % " got rawData of size " % int % " heap size is " % int) cpuTime (rawDataSize raw) bytes
-        nameM <- lift $ (Right <$> selector rawMsg) `catchAll` (return . Left)
+        nameM <- (Right <$> selector rawMsg) `catchAll` (return . Left)
         case nameM of
             Left e ->
-                lift . commLog . logWarning $
+                commLog . logError $
                     sformat ("Error parsing message name: " % shown) e
             Right (name, Nothing) -> do
-                lift . forkLabeled_ "processContent Nothing" . void $ invokeRawListenerSafe $ rawListener (header, raw)
-                lift . commLog . logWarning $
+                forkLabeled_ "processContent Nothing" . void $ invokeRawListenerSafe $ rawListener (header, raw)
+                commLog . logWarning $
                     sformat ("No listener with name "%stext%" defined") name
-                loop
             Right (name, Just (ListenerH f)) -> handleAll handleE $ parseHeaderNNameNContentData rawMsg >>=
                 \(HeaderNNameNContentData _ _ r) -> do
-                    lift . forkLabeled_ "processContent Just" $ do
+                    forkLabeled_ "processContent Just" $ do
                         cont <- invokeRawListenerSafe $ rawListener (header, raw)
                         peer <- peerAddr
                         when cont $ do
-                            lift . commLog . logDebug $
+                            commLog . logDebug $
                                 sformat ("Got message from "%stext%": "%stext)
                                 peer (formatMessage r)
                             invokeListenerSafe name $ f (header, r)
-                    loop
 
 
     handleE e = lift . commLog . logWarning $
                         sformat ("Error parsing message: " % shown) e
 
+    selector :: HeaderNRawData h -> ResponseT m (MessageName, Maybe (ListenerH p h m))
     selector rawMsg = chooseListener rawMsg getListenerNameH listeners
 
     invokeRawListenerSafe = handleAll $ \e -> do
