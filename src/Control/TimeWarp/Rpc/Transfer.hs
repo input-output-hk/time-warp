@@ -475,11 +475,10 @@ sfProcessSocket SocketFrame{..} sock = do
                 -- we expect that, after some reasonable amount of time,
                 -- the data will either go down the wire, or we'll give up
                 -- and let it be collected.
-                let logException e = do
+                let logException = do
                         commLog . logInfo $
-                            sformat ("foreverSend got exception " % shown % ", dropping data of size " % int) e (BL.length bs)
-                        throwM e
-                (sourceLbs bs $$ sinkSocket sock) `catchAll` logException
+                            sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
+                (sourceLbs bs $$ sinkSocket sock) `onException` logException
                 -- TODO: if get async exception here   ^, will send msg twice
                 --
                 -- FIXME ?
@@ -623,8 +622,8 @@ listenInbound (fromIntegral -> port) sink = do
         -- It pulls data from the socket frame's in channel, which is fed by
         -- the socket (see sfProcessSocket).
         unlessInterrupted jc $ do
+            sfReceive sf sink
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
-                sfReceive sf sink
                 -- sfProcessSocket blocks until it gets an event.
                 --
                 -- NB 'sfProcessSocket' will pull from the socket into the
