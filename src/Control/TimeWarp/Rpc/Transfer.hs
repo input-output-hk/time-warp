@@ -694,9 +694,8 @@ getOutConnOrOpen addr@(host, fromIntegral -> port) =
        -- This variant uses an "interrupter" which does nothing, so
        -- interrupting all jobs will not kill the thread and release the
        -- connection as it would if we chose 'addThreadJob'
-       forM_ (sfm :: Maybe SocketFrame) $
-           \sf -> addThreadJob (sfJobCurator sf) $
-               startWorker sf `finally` releaseConn sf
+       forM_ (sfm :: Maybe SocketFrame) $ \sf -> fork_ $
+           startWorker sf `finally` releaseConn sf
        return conn
   where
     addrName = buildNetworkAddress addr
