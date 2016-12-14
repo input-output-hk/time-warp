@@ -146,7 +146,7 @@ import           System.IO.Unsafe                   (unsafePerformIO)
 --   is full.
 sinkTBMChan'
   :: forall m msg .
-     ( Show msg, CanLog m, HasLoggerName m, MonadIO m )
+     ( Show msg, CanLog m, HasLoggerName m, MonadIO m, MonadThrow m )
   => msg
   -> TBM.TBMChan BS.ByteString
   -> Bool
@@ -166,8 +166,9 @@ sinkTBMChan' msg chan shouldClose = loop >> closer
             let bsSize = BS.length x
             lift . commLog . logInfo $
                 sformat ("sinkTBMChan' blocking on full channel with pending data of size " % int % ". " % shown) bsSize msg
-            liftIO . atomically $ TBM.writeTBMChan chan x
-            loop
+            throwM InputChannelFull
+            --liftIO . atomically $ TBM.writeTBMChan chan x
+            --loop
           Just True -> loop
   closer = when shouldClose (liftIO . atomically $ TBM.closeTBMChan chan)
 
@@ -183,6 +184,11 @@ logSeverityUnlessClosed severityIfNotClosed jm msg = do
 -- * Related datatypes
 
 -- ** Exceptions
+
+data IngressException = InputChannelFull
+  deriving (Show, Typeable)
+
+instance Exception IngressException
 
 -- | Error thrown if attempt to listen at already being listened connection is performed.
 data TransferException = AlreadyListeningOutbound Text
@@ -469,9 +475,11 @@ sfProcessSocket SocketFrame{..} sock = do
                 -- we expect that, after some reasonable amount of time,
                 -- the data will either go down the wire, or we'll give up
                 -- and let it be collected.
-                let logException = commLog . logInfo $
-                      sformat ("foreverSend got exception, dropping data of size " % int) (BL.length bs)
-                (sourceLbs bs $$ sinkSocket sock) `onException` logException
+                let logException e = do
+                        commLog . logInfo $
+                            sformat ("foreverSend got exception " % shown % ", dropping data of size " % int) e (BL.length bs)
+                        throwM e
+                (sourceLbs bs $$ sinkSocket sock) `catchAll` logException
                 -- TODO: if get async exception here   ^, will send msg twice
                 --
                 -- FIXME ?
@@ -581,7 +589,6 @@ listenInbound (fromIntegral -> port) sink = do
                 settings <- Transfer ask
                 sf@SocketFrame{..} <- mkSocketFrame settings $ buildSockAddr addr
                 addManagerAsJob serverJobCurator Plain sfJobCurator
-
                 logNewInputConnection sfPeerAddr
                 (processSocket sock sf serverJobCurator)
                     `finally` (closeAndTrace (sock, addr))
@@ -616,8 +623,8 @@ listenInbound (fromIntegral -> port) sink = do
         -- It pulls data from the socket frame's in channel, which is fed by
         -- the socket (see sfProcessSocket).
         unlessInterrupted jc $ do
-            sfReceive sf sink
             handleAll (logErrorOnServerSocketProcessing jc sfPeerAddr) $ do
+                sfReceive sf sink
                 -- sfProcessSocket blocks until it gets an event.
                 --
                 -- NB 'sfProcessSocket' will pull from the socket into the
